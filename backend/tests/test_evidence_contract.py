@@ -1,0 +1,619 @@
+import asyncio
+import os
+from datetime import datetime
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
+from pyasn1.codec.der import encoder
+from pyasn1.type import univ, useful
+
+os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://user:pass@localhost/test")
+os.environ.setdefault("MINIO_ENDPOINT", "http://localhost:9000")
+os.environ.setdefault("MINIO_ACCESS_KEY", "test")
+os.environ.setdefault("MINIO_SECRET_KEY", "test")
+os.environ.setdefault("MINIO_BUCKET", "test")
+os.environ.setdefault("VAULT_URL", "http://localhost:8200")
+os.environ.setdefault("VAULT_TOKEN", "test")
+os.environ.setdefault("SECRET_KEY", "test")
+
+from app.controllers import evidence as evidence_controller
+from app.core import timestamp
+from app.core.timestamp import TimestampAuthorityError
+from app.controllers import evidencetype as evidencetype_controller
+from app.models.schemas import EvidenceCreate
+from app.services import encryption as encryption_service
+from app.services import evidence as evidence_service
+from app.services import metadata as metadata_service
+
+
+def cryptography_available() -> bool:
+    try:
+        encryption_service.get_cipher_dependencies()
+        return True
+    except ImportError:
+        return False
+
+
+class FakeUploadFile:
+    def __init__(self, content: bytes = b"test evidence", filename: str = "evidence.txt"):
+        self.content = content
+        self.filename = filename
+        self.read_called = False
+
+    async def read(self):
+        self.read_called = True
+        return self.content
+
+
+class InMemoryKeyStore:
+    def __init__(self):
+        self.keys = {}
+
+    async def store_key(self, user_id, incident_id, file_id, key_bytes):
+        key_reference = f"evidence/user_{user_id}/incident_{incident_id}/{file_id}"
+        self.keys[key_reference] = key_bytes
+        return key_reference
+
+    async def retrieve_key_by_reference(self, key_reference):
+        return self.keys[key_reference]
+
+
+class InMemoryObjectStorage:
+    def __init__(self):
+        self.files = {}
+
+    async def upload_file(self, file_key, file_bytes):
+        self.files[file_key] = file_bytes
+        return file_key
+
+    async def download_file(self, file_key):
+        return self.files[file_key]
+
+
+class RecordingAuditLogger:
+    def __init__(self):
+        self.actions = []
+
+    async def log_action(self, *args, **kwargs):
+        self.actions.append((args, kwargs))
+
+
+class RecordingTimestampClient:
+    def __init__(self, timestamp_data=None, error=None):
+        self.calls = []
+        self.timestamp_data = timestamp_data or {
+            "authority": "https://tsa.example.test",
+            "hash_algorithm": "sha256",
+            "message_imprint": "abc123",
+            "nonce": "42",
+            "token_der": "base64-token",
+            "time": "2026-06-19T23:00:26Z",
+            "status": "granted",
+        }
+        self.error = error
+
+    async def request_timestamp(self, file_bytes):
+        self.calls.append(file_bytes)
+        if self.error:
+            raise self.error
+        return self.timestamp_data
+
+
+def build_timestamp_response_der(
+    digest: bytes,
+    nonce: int,
+    gen_time: str = "20260619230026Z",
+) -> bytes:
+    hash_algorithm = timestamp.AlgorithmIdentifier()
+    hash_algorithm.setComponentByName(
+        "algorithm", univ.ObjectIdentifier(timestamp.SHA256_OID)
+    )
+    hash_algorithm.setComponentByName("parameters", encoder.encode(univ.Null("")))
+
+    imprint = timestamp.MessageImprint()
+    imprint.setComponentByName("hashAlgorithm", hash_algorithm)
+    imprint.setComponentByName("hashedMessage", digest)
+
+    tst_info = timestamp.TSTInfo()
+    tst_info.setComponentByName("version", 1)
+    tst_info.setComponentByName("policy", univ.ObjectIdentifier("1.2.3.4"))
+    tst_info.setComponentByName("messageImprint", imprint)
+    tst_info.setComponentByName("serialNumber", 456)
+    tst_info.setComponentByName("genTime", useful.GeneralizedTime(gen_time))
+    tst_info.setComponentByName("nonce", nonce)
+
+    encap_content = timestamp.EncapsulatedContentInfo()
+    encap_content.setComponentByName(
+        "eContentType", univ.ObjectIdentifier(timestamp.TST_INFO_OID)
+    )
+    encap_content.setComponentByName("eContent", encoder.encode(tst_info))
+
+    signed_data = timestamp.SignedData()
+    signed_data.setComponentByName("version", 3)
+    digest_algorithms = univ.SetOf(componentType=timestamp.AlgorithmIdentifier())
+    digest_algorithms.append(hash_algorithm)
+    signed_data.setComponentByName("digestAlgorithms", digest_algorithms)
+    signed_data.setComponentByName("encapContentInfo", encap_content)
+    signed_data.setComponentByName("signerInfos", timestamp.SignerInfos())
+
+    token = timestamp.ContentInfo()
+    token.setComponentByName(
+        "contentType", univ.ObjectIdentifier(timestamp.CMS_SIGNED_DATA_OID)
+    )
+    token.setComponentByName("content", encoder.encode(signed_data))
+
+    status_info = timestamp.PKIStatusInfo()
+    status_info.setComponentByName("status", 0)
+
+    response = timestamp.TimeStampResp()
+    response.setComponentByName("status", status_info)
+    response.setComponentByName("timeStampToken", token)
+    return encoder.encode(response)
+
+
+def test_evidence_type_lookup_requires_authentication():
+    app = FastAPI()
+    app.include_router(evidencetype_controller.router)
+
+    async def fake_db():
+        yield object()
+
+    app.dependency_overrides[evidencetype_controller.get_db] = fake_db
+    response = TestClient(app).get("/evidence-types/")
+
+    assert response.status_code == 401
+
+
+def test_evidence_type_lookup_returns_persisted_types(monkeypatch):
+    app = FastAPI()
+    app.include_router(evidencetype_controller.router)
+
+    async def fake_db():
+        yield object()
+
+    app.dependency_overrides[evidencetype_controller.get_db] = fake_db
+    app.dependency_overrides[evidencetype_controller.get_current_user] = lambda: SimpleNamespace(
+        user_id=1
+    )
+    monkeypatch.setattr(
+        evidencetype_controller.evidencetype_service,
+        "get_evidence_types",
+        AsyncMock(
+            return_value=[
+                SimpleNamespace(
+                    evidence_type_id=1,
+                    type_name="written_note",
+                    description="Written text note",
+                ),
+                SimpleNamespace(
+                    evidence_type_id=2,
+                    type_name="audio",
+                    description="Voice or audio recording",
+                ),
+            ]
+        ),
+    )
+
+    response = TestClient(app).get("/evidence-types/")
+
+    assert response.status_code == 200
+    assert response.json() == [
+        {
+            "evidence_type_id": 1,
+            "type_name": "written_note",
+            "description": "Written text note",
+        },
+        {
+            "evidence_type_id": 2,
+            "type_name": "audio",
+            "description": "Voice or audio recording",
+        },
+    ]
+
+
+def test_upload_authorizes_incident_before_reading_file(monkeypatch):
+    upload_file = FakeUploadFile()
+    upload_mock = AsyncMock(return_value=SimpleNamespace(evidence_id=1))
+    monkeypatch.setattr(
+        evidence_controller.incident_service,
+        "get_incident",
+        AsyncMock(side_effect=ValueError("Incident not found")),
+    )
+    monkeypatch.setattr(evidence_controller.evidence_service, "upload_evidence", upload_mock)
+
+    async def call_upload():
+        await evidence_controller.upload_evidence(
+            incident_id=99,
+            evidence_type_id=1,
+            file=upload_file,
+            db=object(),
+            current_user=SimpleNamespace(user_id=5),
+        )
+
+    try:
+        asyncio.run(call_upload())
+    except HTTPException as error:
+        assert error.status_code == 404
+        assert error.detail == "Incident not found"
+    else:
+        raise AssertionError("Expected upload to reject inaccessible incident")
+
+    assert upload_file.read_called is False
+    upload_mock.assert_not_called()
+
+
+def test_user_can_upload_to_authorized_incident(monkeypatch):
+    upload_file = FakeUploadFile(content=b"hello", filename="note.txt")
+    expected = SimpleNamespace(evidence_id=10)
+    upload_mock = AsyncMock(return_value=expected)
+    monkeypatch.setattr(
+        evidence_controller.incident_service,
+        "get_incident",
+        AsyncMock(return_value=SimpleNamespace(incident_id=3)),
+    )
+    monkeypatch.setattr(evidence_controller.evidence_service, "upload_evidence", upload_mock)
+
+    result = asyncio.run(
+        evidence_controller.upload_evidence(
+            incident_id=3,
+            evidence_type_id=1,
+            file=upload_file,
+            evidence_location=None,
+            evidence_imei=None,
+            evidence_device=None,
+            evidence_activation=None,
+            description="Preview",
+            db=object(),
+            current_user=SimpleNamespace(user_id=5),
+        )
+    )
+
+    assert result is expected
+    assert upload_file.read_called is True
+    upload_mock.assert_awaited_once()
+
+def test_get_admin_evidence_returns_all_evidence(monkeypatch):
+    app = FastAPI()
+    app.include_router(evidence_controller.router)
+
+    async def fake_db():
+        yield object()
+
+    app.dependency_overrides[evidence_controller.get_db] = fake_db
+    app.dependency_overrides[evidence_controller.get_current_user] = lambda: SimpleNamespace(
+        user_id=20
+    )
+
+    get_all_evidence_for_admin = AsyncMock(
+        return_value=[
+            SimpleNamespace(
+                evidence_id=40,
+                incident_id=30,
+                user_id=21,
+                evidence_type_id=1,
+                file_name="audio.m4a",
+                evidence_location=None,
+                evidence_imei=None,
+                evidence_device=None,
+                evidence_activation=None,
+                file_path="evidence/user_21/incident_30/audio.bin",
+                file_hash="abc123",
+                created_at=datetime(2026, 1, 4, 12, 30),
+                description=None,
+            )
+        ]
+    )
+    monkeypatch.setattr(
+        metadata_service,
+        "get_all_evidence_for_admin",
+        get_all_evidence_for_admin,
+    )
+
+    response = TestClient(app).get("/evidence/admin/")
+
+    assert response.status_code == 200
+    assert response.json() == [
+        {
+            "evidence_id": 40,
+            "incident_id": 30,
+            "user_id": 21,
+            "evidence_type_id": 1,
+            "file_name": "audio.m4a",
+            "evidence_location": None,
+            "evidence_imei": None,
+            "evidence_device": None,
+            "evidence_activation": None,
+            "file_path": "evidence/user_21/incident_30/audio.bin",
+            "file_hash": "abc123",
+            "created_at": "2026-01-04T12:30:00",
+            "description": None,
+        }
+    ]
+    get_all_evidence_for_admin.assert_awaited_once()
+
+
+def test_timestamp_response_parser_extracts_trusted_gen_time():
+    digest = bytes.fromhex("11" * 32)
+    response_der = build_timestamp_response_der(digest=digest, nonce=123)
+
+    parsed_response = timestamp._parse_timestamp_response(response_der)
+
+    assert parsed_response["status"] == "granted"
+    assert parsed_response["token_info"]["time"] == "2026-06-19T23:00:26Z"
+    assert parsed_response["token_info"]["message_imprint"] == digest.hex()
+    assert parsed_response["token_info"]["nonce"] == "123"
+
+
+def test_upload_evidence_requires_trusted_timestamp_before_encryption():
+    class RecordingEncryptionService:
+        def __init__(self):
+            self.encrypt_called = False
+
+        async def encrypt_file(self, user_id, incident_id, file_bytes):
+            self.encrypt_called = True
+            return {}
+
+        async def decrypt_file(self, file_path, key_reference, iv_nonce):
+            raise NotImplementedError
+
+    class UnusedMetadataRepository:
+        async def save_evidence_metadata(self, *args, **kwargs):
+            raise AssertionError("Evidence metadata should not be saved without a TSA token")
+
+        async def get_evidence(self, db, evidence_id, user_id):
+            raise NotImplementedError
+
+        async def get_evidence_encryption(self, db, evidence_id):
+            raise NotImplementedError
+
+    encryption_fake = RecordingEncryptionService()
+    timestamp_fake = RecordingTimestampClient(
+        error=TimestampAuthorityError("Timestamp authority is not reachable")
+    )
+
+    async def call_upload():
+        await evidence_service.upload_evidence(
+            object(),
+            user_id=1,
+            incident_id=2,
+            file_name="note.txt",
+            file_bytes=b"note body",
+            data=EvidenceCreate(incident_id=2, evidence_type_id=1),
+            encryption_service=encryption_fake,
+            metadata_repository=UnusedMetadataRepository(),
+            audit_logger=RecordingAuditLogger(),
+            timestamp_client=timestamp_fake,
+        )
+
+    try:
+        asyncio.run(call_upload())
+    except TimestampAuthorityError as error:
+        assert str(error) == "Timestamp authority is not reachable"
+    else:
+        raise AssertionError("Expected upload to fail when the TSA cannot be reached")
+
+    assert timestamp_fake.calls == [b"note body"]
+    assert encryption_fake.encrypt_called is False
+
+
+def test_upload_evidence_persists_trusted_timestamp_metadata():
+    expected_timestamp = {
+        "authority": "https://tsa.example.test",
+        "hash_algorithm": "sha256",
+        "message_imprint": "0" * 64,
+        "nonce": "123",
+        "token_der": "trusted-token",
+        "status": "granted",
+    }
+
+    class RecordingEncryptionService:
+        async def encrypt_file(self, user_id, incident_id, file_bytes):
+            return {
+                "file_path": "evidence/user_1/incident_2/file.bin",
+                "key_reference": "key/ref",
+                "iv_nonce": "nonce",
+                "hmac_hash": "hmac",
+            }
+
+        async def decrypt_file(self, file_path, key_reference, iv_nonce):
+            raise NotImplementedError
+
+    class RecordingMetadataRepository:
+        def __init__(self):
+            self.timestamp_data = None
+
+        async def save_evidence_metadata(
+            self,
+            db,
+            user_id,
+            incident_id,
+            file_name,
+            encryption_data,
+            timestamp_data,
+            data,
+        ):
+            self.timestamp_data = timestamp_data
+            return SimpleNamespace(evidence_id=77, incident_id=incident_id, file_name=file_name)
+
+        async def get_evidence(self, db, evidence_id, user_id):
+            raise NotImplementedError
+
+        async def get_evidence_encryption(self, db, evidence_id):
+            raise NotImplementedError
+
+    metadata_fake = RecordingMetadataRepository()
+    timestamp_fake = RecordingTimestampClient(timestamp_data=expected_timestamp)
+    audit_logger = RecordingAuditLogger()
+
+    result = asyncio.run(
+        evidence_service.upload_evidence(
+            object(),
+            user_id=1,
+            incident_id=2,
+            file_name="note.txt",
+            file_bytes=b"note body",
+            data=EvidenceCreate(incident_id=2, evidence_type_id=1),
+            encryption_service=RecordingEncryptionService(),
+            metadata_repository=metadata_fake,
+            audit_logger=audit_logger,
+            timestamp_client=timestamp_fake,
+        )
+    )
+
+    assert result.evidence_id == 77
+    assert timestamp_fake.calls == [b"note body"]
+    assert metadata_fake.timestamp_data == expected_timestamp
+    assert len(audit_logger.actions) == 1
+
+
+@pytest.mark.skipif(
+    not cryptography_available(),
+    reason="cryptography backend is unavailable in this environment",
+)
+def test_encrypt_decrypt_round_trip_for_utf8_text():
+    key_store = InMemoryKeyStore()
+    object_storage = InMemoryObjectStorage()
+
+    original = "A written note with UTF-8: veilig".encode("utf-8")
+    encryption_data = asyncio.run(
+        encryption_service.encrypt_file(
+            1,
+            2,
+            original,
+            key_store=key_store,
+            object_storage=object_storage,
+        )
+    )
+    decrypted = asyncio.run(
+        encryption_service.decrypt_file(
+            encryption_data["file_path"],
+            encryption_data["key_reference"],
+            encryption_data["iv_nonce"],
+            key_store=key_store,
+            object_storage=object_storage,
+        )
+    )
+
+    assert decrypted == original
+
+
+@pytest.mark.skipif(
+    not cryptography_available(),
+    reason="cryptography backend is unavailable in this environment",
+)
+def test_encrypt_decrypt_round_trip_for_binary_file():
+    key_store = InMemoryKeyStore()
+    object_storage = InMemoryObjectStorage()
+
+    original = bytes([0, 1, 2, 3, 127, 128, 255])
+    encryption_data = asyncio.run(
+        encryption_service.encrypt_file(
+            1,
+            2,
+            original,
+            key_store=key_store,
+            object_storage=object_storage,
+        )
+    )
+    decrypted = asyncio.run(
+        encryption_service.decrypt_file(
+            encryption_data["file_path"],
+            encryption_data["key_reference"],
+            encryption_data["iv_nonce"],
+            key_store=key_store,
+            object_storage=object_storage,
+        )
+    )
+
+    assert decrypted == original
+
+
+def test_download_evidence_rejects_unauthorized_access():
+    class RejectingMetadataRepository:
+        async def get_evidence(self, db, evidence_id, user_id):
+            raise ValueError("Evidence not found or access denied")
+
+        async def get_evidence_encryption(self, db, evidence_id):
+            raise AssertionError("Encryption metadata should not be loaded")
+
+    class RecordingEncryptionService:
+        def __init__(self):
+            self.decrypt_called = False
+
+        async def encrypt_file(self, user_id, incident_id, file_bytes):
+            raise NotImplementedError
+
+        async def decrypt_file(self, file_path, key_reference, iv_nonce):
+            self.decrypt_called = True
+            return b""
+
+    encryption_fake = RecordingEncryptionService()
+
+    async def call_download():
+        await evidence_service.download_evidence(
+            object(),
+            user_id=5,
+            evidence_id=10,
+            encryption_service=encryption_fake,
+            metadata_repository=RejectingMetadataRepository(),
+            audit_logger=RecordingAuditLogger(),
+        )
+
+    try:
+        asyncio.run(call_download())
+    except ValueError as error:
+        assert str(error) == "Evidence not found or access denied"
+    else:
+        raise AssertionError("Expected unauthorized download to be rejected")
+
+    assert encryption_fake.decrypt_called is False
+
+
+def test_download_evidence_returns_decrypted_bytes():
+    expected = b"original note"
+
+    class DownloadMetadataRepository:
+        async def get_evidence(self, db, evidence_id, user_id):
+            return SimpleNamespace(
+                evidence_id=10,
+                incident_id=3,
+                file_path="evidence/user_1/incident_3/file.bin",
+                file_name="note.txt",
+            )
+
+        async def get_evidence_encryption(self, db, evidence_id):
+            return SimpleNamespace(
+                aes_key_reference="evidence/user_1/incident_3/file",
+                iv_nonce="nonce",
+            )
+
+    class DecryptingEncryptionService:
+        async def encrypt_file(self, user_id, incident_id, file_bytes):
+            raise NotImplementedError
+
+        async def decrypt_file(self, file_path, key_reference, iv_nonce):
+            return expected
+
+    audit_logger = RecordingAuditLogger()
+
+    result = asyncio.run(
+        evidence_service.download_evidence(
+            object(),
+            user_id=1,
+            evidence_id=10,
+            encryption_service=DecryptingEncryptionService(),
+            metadata_repository=DownloadMetadataRepository(),
+            audit_logger=audit_logger,
+        )
+    )
+
+    assert result == expected
+    assert len(audit_logger.actions) == 1
+
+
+def test_evidence_create_schema_has_no_file_body_field():
+    assert "data" not in EvidenceCreate.model_fields
+    assert "file_bytes" not in EvidenceCreate.model_fields
