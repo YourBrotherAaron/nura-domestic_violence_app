@@ -1,11 +1,14 @@
+import os
 import mimetypes
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.services import evidence as evidence_service
 from app.services import metadata as metadata_service
 
-# Address of the Flask Whisper service running on the local server
-WHISPER_URL = "http://192.168.178.73:5000/transcribe"
+# Address of the Flask Whisper service. Configurable via the WHISPER_URL env var
+# (e.g. http://whisper:5000/transcribe when running in Docker Compose); falls back
+# to the original fixed LAN address when the variable is not set.
+WHISPER_URL = os.getenv("WHISPER_URL", "http://192.168.178.73:5000/transcribe")
 
 # Generous timeout (seconds) since large audio files can take a while on CPU
 WHISPER_TIMEOUT = 300.0

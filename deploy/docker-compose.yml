@@ -1,0 +1,223 @@
+# ============================================================================
+# Nura / EviSafe — full stack for EduCloud (or any Docker host)
+# ============================================================================
+# Brings up every backend service on one machine:
+#   postgres, minio, openbao (vault), backend API, whisper, integrity checker.
+# Only the backend API (8000) and the integrity dashboard (8001) are published
+# to the host; everything else talks over the internal Docker network.
+#
+# Usage (on the VM):
+#   cd deploy
+#   cp .env.example .env      # then edit secrets
+#   docker compose up -d --build
+#
+# Reach the API at:  http://<VM-IP>:8000   (docs at /docs)
+# Integrity board:   http://<VM-IP>:8001
+# ============================================================================
+
+services:
+  # --- Database -------------------------------------------------------------
+  postgres:
+    image: postgres:16
+    container_name: nura-postgres
+    restart: always
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Runs ONLY on first init (empty data dir): creates tables + seeds types.
+      - ./postgres/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [nura]
+
+  # --- Object storage (encrypted evidence) ----------------------------------
+  # Pulled from quay.io, not Docker Hub: MinIO restricted anonymous pulls of
+  # minio/minio on Docker Hub in 2024/2025 (requires a paid login there now).
+  # quay.io/minio/minio remains free to pull.
+  minio:
+    image: quay.io/minio/minio:latest
+    container_name: nura-minio
+    restart: always
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
+    volumes:
+      - minio_data:/data
+    networks: [nura]
+
+  # Creates the evidence bucket once MinIO is up, then exits.
+  minio-init:
+    image: quay.io/minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_started
+    entrypoint: >
+      sh -c "
+        until mc alias set local http://minio:9000 ${MINIO_ACCESS_KEY} ${MINIO_SECRET_KEY}; do
+          echo 'Waiting for MinIO...'; sleep 2;
+        done;
+        mc mb local/${MINIO_BUCKET} --ignore-existing;
+        echo 'MinIO bucket ready.';
+      "
+    networks: [nura]
+
+  # --- Secret store (AES + HMAC keys) ---------------------------------------
+  # Dev mode = in-memory: keys are lost if this container is recreated, which
+  # marks previously uploaded evidence 'unverifiable'. Fine for a dev/UI env;
+  # use a persistent OpenBao config for anything long-lived.
+  vault:
+    image: ghcr.io/openbao/openbao:latest
+    container_name: nura-vault
+    restart: always
+    cap_add: [IPC_LOCK]
+    command: server -dev -dev-root-token-id=${VAULT_TOKEN} -dev-listen-address=0.0.0.0:8200
+    environment:
+      OPENBAO_DEV_ROOT_TOKEN_ID: ${VAULT_TOKEN}
+      OPENBAO_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+    healthcheck:
+      test: ["CMD", "bao", "status", "-address=http://127.0.0.1:8200"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [nura]
+
+  # Enables the KV v2 mount named 'Domestic' that the app expects, then exits.
+  vault-init:
+    image: ghcr.io/openbao/openbao:latest
+    depends_on:
+      vault:
+        condition: service_healthy
+    environment:
+      BAO_ADDR: http://vault:8200
+      BAO_TOKEN: ${VAULT_TOKEN}
+    entrypoint: >
+      sh -c "
+        bao secrets enable -path=Domestic kv-v2 || true;
+        echo 'Vault Domestic mount ready.';
+      "
+    networks: [nura]
+
+  # --- Backend API ----------------------------------------------------------
+  backend:
+    build:
+      context: ../backend
+    image: nura-backend:latest
+    container_name: nura-backend
+    restart: always
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      MINIO_BUCKET: ${MINIO_BUCKET}
+      VAULT_URL: http://vault:8200
+      VAULT_TOKEN: ${VAULT_TOKEN}
+      SECRET_KEY: ${SECRET_KEY}
+      WHISPER_URL: http://whisper:5000/transcribe
+      CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS}
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      vault:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    networks: [nura]
+
+  # --- Whisper transcription ------------------------------------------------
+  whisper:
+    build:
+      context: ../whisper-service
+    image: nura-whisper:latest
+    container_name: nura-whisper
+    restart: always
+    volumes:
+      - whisper_models:/models   # persists the ~1.5GB model between restarts
+    networks: [nura]
+
+  # --- Integrity checker: dashboard/API ------------------------------------
+  integrity-api:
+    build:
+      context: ../integrity-checker/api
+    image: nura-integrity-api:latest
+    container_name: nura-integrity-api
+    restart: always
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      MINIO_BUCKET: ${MINIO_BUCKET}
+      VAULT_URL: http://vault:8200
+      VAULT_TOKEN: ${VAULT_TOKEN}
+      VAULT_SKIP_VERIFY: "false"
+    ports:
+      - "8001:8001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [nura]
+
+  # --- Integrity checker: background worker ---------------------------------
+  integrity-checker:
+    build:
+      context: ../integrity-checker/integrity_checker
+    image: nura-integrity-worker:latest
+    container_name: nura-integrity-worker
+    restart: always
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      MINIO_BUCKET: ${MINIO_BUCKET}
+      VAULT_URL: http://vault:8200
+      VAULT_TOKEN: ${VAULT_TOKEN}
+      VAULT_SKIP_VERIFY: "false"
+      CHECK_INTERVAL_SECONDS: ${CHECK_INTERVAL_SECONDS}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [nura]
+
+  # --- One-shot seeder: demo user + sample cases/incidents ------------------
+  seeder:
+    image: python:3.11-slim
+    container_name: nura-seeder
+    restart: "no"
+    volumes:
+      - ./seed.py:/seed.py:ro
+    environment:
+      API_BASE_URL: http://backend:8000
+      DEMO_EMAIL: ${DEMO_EMAIL}
+      DEMO_PASSWORD: ${DEMO_PASSWORD}
+      DEMO_FIRST_NAME: ${DEMO_FIRST_NAME}
+      DEMO_LAST_NAME: ${DEMO_LAST_NAME}
+    command: ["python", "/seed.py"]
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks: [nura]
+
+networks:
+  nura:
+    name: nura-network
+
+volumes:
+  postgres_data:
+  minio_data:
+  whisper_models:
